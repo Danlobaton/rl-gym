@@ -53,3 +53,5 @@ Once I had traces, the next problem was querying them. I added Hive-style partit
 I also read [Han Lee's taxonomy paper](https://leehanchung.github.io/blogs/2026/03/21/rl-environments-for-llm-agents/), especially the trajectory-vs-trace distinction. What I built was a trace, not a trajectory. A trajectory is what the trainer needs at token level. At this stage, trace quality was the priority. In production systems both are shipped, and ProRL Agent's token-in/token-out design exists because re-tokenizing from string traces introduces drift.
 
 My mental model now: episode records have two first-class consumers — the trainer (token fidelity, optimization correctness) and the human/observability stack (debuggability). I can defer trainer-side sophistication early, but I cannot defer observability and still call the gym usable.
+
+# Phase 3: File System Materialization

@@ -1,6 +1,7 @@
 import argparse
 import glob
 import json
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,8 +15,9 @@ def cmd_rollout(args: argparse.Namespace) -> None:
 
     env = IncidentEnv()
     run_id = uuid.uuid4().hex[:12]
+    run_started_at = time.time()
     for seed in range(args.episodes):
-        trace = run_episode(env, seed, run_id=run_id)
+        trace = run_episode(env, seed, run_id=run_id, run_started_at=run_started_at)
         path = write_trace(trace)
         print(
             f"seed={seed} reward={trace.total_reward:+.2f} "

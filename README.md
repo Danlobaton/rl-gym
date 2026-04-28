@@ -55,32 +55,39 @@ python main.py rollout --episodes 20
 
 ### Trace layout
 
-Traces are written as JSONL under Hive-style partitions, with both the `run_id`
-and the `seed` embedded in the filename so you can grep without opening files:
+Traces are written as JSONL under nested Hive-style partitions, with both the
+`run_id` and the `seed` embedded in the filename so you can grep without
+opening files:
 
 ```text
 traces/
-  dt=2026-04-28/                                          # UTC partition
-    run_id=abc123def456_seed=000000.jsonl
-    run_id=abc123def456_seed=000001.jsonl
-    ...
+  dt=2026-04-28/                                            # UTC date
+    ts=15-30-45Z/                                           # UTC start time of the run
+      run_id=abc123def456_seed=000000.jsonl
+      run_id=abc123def456_seed=000001.jsonl
+      ...
+    ts=18-12-03Z/                                           # a second run, same day
+      run_id=def456abc789_seed=000000.jsonl
+      ...
 ```
 
-One `run_id` per `rollout` invocation; one file per episode. Inside each file,
-line 1 is trace metadata (run_id, seed, agent, task, reward, ground truth, …)
-and lines 2..n are step records.
+One `run_id` per `rollout` invocation; one file per episode; one `ts=` partition
+per run, so multiple runs on the same day don't collide. Inside each file,
+line 1 is trace metadata (run_id, run_started_at, seed, agent, task, reward,
+ground truth, …) and lines 2..n are step records.
 
 ### Inspect a trace — `show`
 
 ```bash
 # Pretty-print one trace (observations truncated to a 100-char preview)
-python main.py show traces/dt=2026-04-28/run_id=abc123def456_seed=000003.jsonl
+python main.py show traces/dt=2026-04-28/ts=15-30-45Z/run_id=abc123def456_seed=000003.jsonl
 
 # Print full observations — what the agent actually saw at step 7
 python main.py show <path> --full
 
 # Summary mode: one header-line per match. Cheap even on thousands of files.
-python main.py show --filter 'traces/dt=2026-04-28/*.jsonl'
+python main.py show --filter 'traces/dt=2026-04-28/**/*.jsonl'      # whole day
+python main.py show --filter 'traces/dt=2026-04-28/ts=15-30-45Z/*.jsonl'  # one run
 ```
 
 ### Verify env determinism — `replay`
@@ -89,7 +96,7 @@ python main.py show --filter 'traces/dt=2026-04-28/*.jsonl'
 # Re-runs the env from the trace's seed, feeds the recorded actions back,
 # and checks observations + rewards are byte-identical. Exits non-zero on
 # divergence — wedge it into CI to catch determinism regressions.
-python main.py replay traces/dt=2026-04-28/run_id=abc123def456_seed=000003.jsonl
+python main.py replay traces/dt=2026-04-28/ts=15-30-45Z/run_id=abc123def456_seed=000003.jsonl
 
 # Audit every trace under traces/ — one PASS/FAIL line per file, plus totals.
 # Exits non-zero if any trace fails. Drop into CI to guard the determinism

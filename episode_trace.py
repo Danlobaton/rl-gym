@@ -14,8 +14,9 @@ class TraceStep:
 
 @dataclass
 class Trace:
-    schema_version: str # "1.0" — bump on incompatible change
+    schema_version: str # "1.1" — bump on incompatible change
     run_id: str # shared across all episodes in one rollout invocation
+    run_started_at: float # UTC unix timestamp; shared across the run, drives partition path
     agent_name: str
     agent_config: dict
     seed: int
@@ -29,13 +30,14 @@ class Trace:
 
 
 def write_trace(trace: Trace, root: Path | str = "traces") -> Path:
-    """Write a trace as JSONL under hive-style `dt=YYYY-MM-DD/` partition.
+    """Write a trace as JSONL under hive-style `dt=YYYY-MM-DD/ts=HH-MM-SSZ/` partition.
 
     Filename: run_id={run_id}_seed={seed:06d}.jsonl. UTC partitions so
-    rollouts in different timezones land in the same bucket.
+    rollouts in different timezones land in the same bucket; the nested
+    `ts=` partition disambiguates multiple runs on the same day.
     """
-    dt = datetime.fromtimestamp(trace.started_at, tz=timezone.utc).strftime("%Y-%m-%d")
-    partition = Path(root) / f"dt={dt}"
+    when = datetime.fromtimestamp(trace.run_started_at, tz=timezone.utc)
+    partition = Path(root) / f"dt={when:%Y-%m-%d}" / f"ts={when:%H-%M-%S}Z"
     partition.mkdir(parents=True, exist_ok=True)
     path = partition / f"run_id={trace.run_id}_seed={trace.seed:06d}.jsonl"
 

@@ -33,6 +33,7 @@ def run_episode(
     env: IncidentEnv,
     seed: int,
     run_id: str,
+    run_started_at: float,
     model: str = DEFAULT_MODEL,
     max_tokens: int = DEFAULT_MAX_TOKENS,
 ) -> Trace:
@@ -85,8 +86,9 @@ def run_episode(
         history.append(_message("user", result.observation))
 
     return Trace(
-        schema_version="1.0",
+        schema_version="1.1",
         run_id=run_id,
+        run_started_at=run_started_at,
         agent_name=model,
         agent_config={"model": model, "max_tokens": max_tokens},
         seed=seed,

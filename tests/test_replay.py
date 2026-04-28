@@ -36,18 +36,19 @@ def make_trace(seed: int = 7) -> Trace:
         ))
         if r.terminated or r.truncated:
             break
+    now = time.time()
     return Trace(
-        schema_version="1.0", run_id="test", agent_name="dummy", agent_config={},
+        schema_version="1.1", run_id="test", run_started_at=now,
+        agent_name="dummy", agent_config={},
         seed=seed, task_meta={"incident_type": env.incident.incident_type},
         steps=steps, total_reward=sum(s.reward for s in steps),
         reward_breakdown=steps[-1].info.get("breakdown", {}),
         ground_truth=steps[-1].info.get("ground_truth", {}),
-        started_at=time.time(), ended_at=time.time(),
+        started_at=now, ended_at=now,
     )
 
 
 # --- core contract: a clean trace replays byte-identically ----------------
-
 
 def test_clean_trace_replays_with_zero_diffs():
     trace = asdict(make_trace())
@@ -78,6 +79,8 @@ def test_observation_mismatch_is_detected():
     assert len(diffs) == 1
     _, kind, env_val, trace_val = diffs[0]
     assert kind == "observation"
+    assert isinstance(trace_val, str)
+    assert isinstance(env_val, str)
     assert "TAMPERED" in trace_val
     assert "TAMPERED" not in env_val
 
