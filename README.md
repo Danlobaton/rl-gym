@@ -43,17 +43,62 @@ The reward shaping is decomposed into separately-tunable terms specifically so t
 ## Quickstart
 
 ```bash
-# No deps, no API key — establish the floor:
-python run.py rollout --agent scripted --episodes 5
+pip install -r requirements.txt
+export ANTHROPIC_API_KEY=sk-ant-...   # or drop it in a .env at the repo root
 
-# Real LLM, real sandbox, real traces:
-pip install anthropic
-export ANTHROPIC_API_KEY=sk-ant-...
-python run.py rollout --agent llm --episodes 20 --concurrency 8
+# Run 5 rollouts (default) and write traces to ./traces/
+python main.py rollout
 
-# Inspect a trace:
-python run.py show ./traces/.../seed000003.jsonl.gz
+# More episodes — one shared run_id across all of them
+python main.py rollout --episodes 20
 ```
+
+### Trace layout
+
+Traces are written as JSONL under Hive-style partitions, with both the `run_id`
+and the `seed` embedded in the filename so you can grep without opening files:
+
+```text
+traces/
+  dt=2026-04-28/                                          # UTC partition
+    run_id=abc123def456_seed=000000.jsonl
+    run_id=abc123def456_seed=000001.jsonl
+    ...
+```
+
+One `run_id` per `rollout` invocation; one file per episode. Inside each file,
+line 1 is trace metadata (run_id, seed, agent, task, reward, ground truth, …)
+and lines 2..n are step records.
+
+### Inspect a trace — `show`
+
+```bash
+# Pretty-print one trace (observations truncated to a 100-char preview)
+python main.py show traces/dt=2026-04-28/run_id=abc123def456_seed=000003.jsonl
+
+# Print full observations — what the agent actually saw at step 7
+python main.py show <path> --full
+
+# Summary mode: one header-line per match. Cheap even on thousands of files.
+python main.py show --filter 'traces/dt=2026-04-28/*.jsonl'
+```
+
+### Verify env determinism — `replay`
+
+```bash
+# Re-runs the env from the trace's seed, feeds the recorded actions back,
+# and checks observations + rewards are byte-identical. Exits non-zero on
+# divergence — wedge it into CI to catch determinism regressions.
+python main.py replay traces/dt=2026-04-28/run_id=abc123def456_seed=000003.jsonl
+
+# Audit every trace under traces/ — one PASS/FAIL line per file, plus totals.
+# Exits non-zero if any trace fails. Drop into CI to guard the determinism
+# contract across your whole archive.
+python main.py replay audit
+```
+
+Replay verifies the env, not the agent. The LLM is allowed to be stochastic;
+the env must be a pure function of (seed, action sequence).
 
 ## Things this isn't
 
@@ -64,6 +109,5 @@ python run.py show ./traces/.../seed000003.jsonl.gz
 ## Roadmap (a.k.a. things I would ship if I had more time/sleep/caffeine)
 
 - CDK stack: ECS Fargate Spot, SQS dispatch, S3 traces, DynamoDB scoreboard. Same Docker image, different env vars.
-- A `replay` command that re-runs a trace from its seed and verifies byte-identical actions. "Any failed rollout is reproducible" is the actual selling point of an env platform; everything else is decoration.
 - LLM-as-judge for the diagnosis-quality term, async, on a sampled subset.
 - A second env (terminal-bench-flavored) sharing the same base classes. The whole point of getting the contracts right is that the second one is cheap.
