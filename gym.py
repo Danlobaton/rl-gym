@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 import random
 
+from incidents import INCIDENTS, Incident
+
 @dataclass
 class StepResult:
     observation: str # What the agent sees next
@@ -8,37 +10,6 @@ class StepResult:
     terminated: bool # episode is done and ended naturally
     truncated: bool # episode hit the step limit
     info: dict # contains debugging, ground truth, etc.
-
-@dataclass
-class Incident:
-    incident_type: str
-    affected_service: str
-    alert_text: str
-    logs: dict[str, list[str]] # key is the log source, value is the list of logs
-    metrics: dict[str, list[int | float]]  # time series per metric name
-    root_cause: str # the root cause of the incident e.g. "oomkilled"
-    correct_action: str  # the correct action to take to resolve the incident
-
-INCIDENTS = [
-    Incident(
-        incident_type="high_latency",
-        affected_service="payments-api",
-        alert_text="payments-api p99 latency > 2000ms for 5min",
-        logs={
-            "payments-api": [
-                "[INFO] handling request id=12345",
-                "[WARN] db pool 50/50, queueing",
-                "[ERROR] timeout acquiring db connection",
-                "[ERROR] request id=12345 failed: ConnectionTimeoutError",
-            ]
-        },
-        metrics={
-            "request_latency_p99_ms": [200, 350, 500, 1200, 5000],
-        },
-        root_cause="db_pool_exhausted",
-        correct_action="scale_db_pool",
-    ),
-]
 
 # Tools
 def tail_logs(incident: Incident, service: str, lines: int = 50) -> str:
