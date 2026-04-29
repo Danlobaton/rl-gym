@@ -1,36 +1,142 @@
-# Intro
+# Architecture
 
-This doc serves as both an intro to gym architecture as well as the cloud architecture for this gym.
+This repo is an SRE RL gym built around one core constraint:
 
-## Domain model
+- Keep environment dynamics deterministic and replayable.
+- Keep scoring (rubric/judge) separate from environment transition logic.
+- Keep rollout artifacts first-class (trace -> replay -> audit).
 
-Tasks
+## What Matters
 
-A task is a (problem, hidden ground truth) pair. For SREGym, a task is one synthetic incident.
-Each task has:
+- `Env` is pure episode dynamics (`reset`, `step`) with reward always `0.0`.
+- `Rubric` scores completed trajectories out-of-band (including optional LLM judge).
+- `Inference` backend is pluggable (`AnthropicClient` for eval/demo, `VllmClient` for trainable rollouts with token/logprob capture).
+- `Trace` is the contract between rollout, replay, and downstream training.
+- Same rollout path runs in-process or over HTTP (`EnvClient` / `server.py`).
 
-- Public fields the agent sees on `reset()`: incident type, affected service, related services, alert text, available tools, step budget.
-- Hidden fields only the verifier sees: root cause slug, correct remediation action, expected investigation pattern, list of known safety-violation predicates.
-- Materialized state written to a per-episode tmpdir: synthetic logs, metrics CSVs, kubectl describe blobs. Generated deterministically from the seed. Causally consistent with the hidden ground truth.
+---
 
-## High-Level Architecture of RL Environments
+## 1) Cloud Architecture
+
+Derived from the CDK app composition in `infra/bin/app.ts` (`NetworkStack`, `DataStack`, `EnvStack`, `CoordinatorStack`).
 
 ```text
-                    ┌────────────────────┐
-                    │  Trainer cluster   │  ← FSDP, GPU-heavy, its own SLA
-                    └─────────┬──────────┘
-                              │ trajectories (token-in/token-out)
-                    ┌─────────▼──────────┐
-                    │  Rollout service   │  ← vLLM, GPU pool, async
-                    │    (inference)     │
-                    └─────────┬──────────┘
-                              │ HTTP (OpenEnv) or in-proc (verifiers)
-              ┌───────────────┼───────────────┐
-              ▼               ▼               ▼
-         ┌─────────┐     ┌─────────┐     ┌─────────┐
-         │   Env   │     │   Env   │     │   Env   │  ← Container fleet
-         │ replica │     │ replica │     │ replica │     CPU-heavy, cheap
-         └────┬────┘     └────┬────┘     └────┬────┘     scales horizontally
-              │               │               │
-              └────── traces (S3 / DB) ───────┘  ← observability path
+                         ┌───────────────────────────────────────┐
+                         │             Internet / CI             │
+                         └───────────────────┬───────────────────┘
+                                             │
+                                   ┌─────────▼─────────┐
+                                   │ Coordinator ECS    │
+                                   │ (rollout runner)   │
+                                   └───────┬────────────┘
+                                           │ dispatch / control plane
+                    ┌──────────────────────┼──────────────────────────┐
+                    │                      │                          │
+          ┌─────────▼─────────┐  ┌────────▼────────┐      ┌─────────▼─────────┐
+          │   SQS Job Queue    │  │   Runs Table     │      │   Traces Bucket    │
+          │ (episode dispatch) │  │ (run metadata)   │      │ (JSONL artifacts)  │
+          └────────────────────┘  └──────────────────┘      └────────────────────┘
+                                           │
+                              ┌────────────▼────────────┐
+                              │ Env ALB + Env ECS Fleet │
+                              │ (/reset, /step OpenEnv) │
+                              └────────────┬────────────┘
+                                           │
+                               ┌───────────▼───────────┐
+                               │ Per-episode workdirs  │
+                               │ logs/metrics/tmp state│
+                               └───────────────────────┘
+
+Cross-cutting: VPC + SG boundaries, KMS encryption, ECR images, secret for Anthropic key.
+```
+
+### Why this shape
+
+- Coordinator and Env workers scale independently (control plane vs step execution).
+- Queue decouples rollout submission from worker elasticity.
+- Trace/object storage is immutable-by-convention and replay-friendly.
+- Env fleet can be replaced (container runtime, infra substrate) without changing coordinator contracts.
+
+---
+
+## 2) Gym Runtime Architecture (Single Episode Dataflow)
+
+```text
+         ┌──────────────────────────────────────────────────────────────┐
+         │                      sregym.cli rollout                     │
+         └──────────────────────────────┬───────────────────────────────┘
+                                        │
+                              run_episode(env, inference, rubric)
+                                        │
+                    ┌───────────────────┴───────────────────┐
+                    │                                       │
+          ┌─────────▼──────────┐                  ┌─────────▼──────────┐
+          │ Inference backend   │                  │   IncidentEnv       │
+          │ Anthropic / vLLM    │                  │ reset/step dynamics │
+          └─────────┬──────────┘                  └─────────┬──────────┘
+                    │ model text/action JSON                │ obs/info
+                    └───────────────┬───────────────────────┘
+                                    │
+                           ┌────────▼────────┐
+                           │   TraceStep[]   │
+                           │ action, obs,    │
+                           │ latency, tokens │
+                           └────────┬────────┘
+                                    │ terminal trajectory
+                           ┌────────▼────────┐
+                           │ Rubric.score()  │
+                           │ deterministic + │
+                           │ optional judge  │
+                           └────────┬────────┘
+                                    │
+                           ┌────────▼───────────┐
+                           │ Trace (schema 1.x) │
+                           │ write_trace()      │
+                           └────────┬───────────┘
+                                    │
+                           replay/show/audit tooling
+```
+
+### Important contracts
+
+- Env emits ground truth at terminal step; rubric consumes it.
+- Rubric owns reward; env reward stays neutral to avoid mixing concerns.
+- vLLM path captures token IDs + logprobs for RL-trainable traces; closed APIs leave token fields empty by design.
+
+---
+
+## 3) Software Architecture (Repo-Level Components)
+
+```text
+                    ┌────────────────────────────┐
+                    │          main.py           │
+                    │      -> sregym.cli         │
+                    └─────────────┬──────────────┘
+                                  │
+         ┌────────────────────────┼────────────────────────┐
+         │                        │                        │
+ ┌───────▼────────┐      ┌────────▼────────┐      ┌────────▼────────┐
+ │  sregym.agent   │      │   sregym.env    │      │  sregym.rubric  │
+ │ episode runner  │<---->│ dynamics/tools  │      │ episode scoring │
+ └───────┬─────────┘      └────────┬────────┘      └────────┬────────┘
+         │                          │                        │
+         │                   ┌──────▼──────┐                 │
+         │                   │ sregym.tools│                 │
+         │                   │ log/metric  │                 │
+         │                   └─────────────┘                 │
+         │                                                   │
+ ┌───────▼──────────────┐                          ┌─────────▼───────────┐
+ │      inference/      │                          │    sregym.trace      │
+ │ Anthropic / vLLM impl│                          │ trace schema + IO    │
+ └───────┬──────────────┘                          └─────────┬───────────┘
+         │                                                   │
+         └──────────────┬────────────────────────────────────┘
+                        │
+                ┌───────▼────────┐
+                │ sregym.replay  │
+                │ determinism/audit
+                └────────────────┘
+
+Optional remote mode:
+sregym.server (FastAPI OpenEnv endpoints) <-> sregym.client (HTTP env client)
 ```

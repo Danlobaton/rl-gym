@@ -23,28 +23,26 @@ resolve(root_cause, action)
 
 I picked SRE because I was on-call the week before, it sucked, and it was the freshest thing on my mind.
 
-**What I learned:** TL;DR this is hard. See [RESEARCH_LOG.md](./RESEARCH_LOG.md) for a running log of my findings, learnings, progress.
-
-## What's actually under the hood
-
-- **Procedurally generated incidents.** Each seed yields a different incident type, service, and root cause, plus a per-episode workdir of synthetic logs (`logs/<service>.log`), metric CSVs (`metrics/<metric>.csv`), and a `kubectl_describe.txt` blob — all causally consistent with the hidden ground truth. OOMKilled crashloops have cut-off logs; bad-deploy error spikes correlate with a deploy event in the log. The agent has to reverse-engineer the cause from the evidence.
-- **A real subprocess sandbox.** `tail_logs` literally runs `tail -n 50` (with optional `| grep PATTERN`). `query_metrics` shells out to `tail | awk` against the metric CSVs. Every agent-controlled string passes through `shlex.quote`; tools have a 5-second timeout. Swapping the fake filesystem for a real container is mechanical, not a rewrite.
-- **Containerized env behind an HTTP API.** A FastAPI server (`sregym/server.py`) exposes `/reset` and `/step` per OpenEnv. One container = one episode at a time, enforced by a session-token mechanism that rejects stale or post-terminate `/step` calls with a clean 409. Scale by running multiple containers; the rollout CLI reaches any of them via `--env-url`.
-- **Trace persistence with replay-based determinism checks.** Every episode writes a JSONL trace under nested Hive-style partitions (`dt=YYYY-MM-DD/ts=HH-MM-SSZ/`). `python main.py replay <trace>` re-runs the env from the same seed, feeds the recorded actions back, and verifies byte-identical observations + rewards. `replay audit` does this across every trace under `traces/` and exits non-zero on any divergence.
-- **Pluggable inference behind a Protocol.** Two backends today: `inference.anthropic_client.AnthropicClient` (text only — closed API, not RL-trainable) and `inference.vllm.VllmClient` (token IDs + per-token logprobs from vLLM's native `/generate` endpoint, the trace-vs-trajectory pivot for RL training).
-- **Episode scoring as a separate `Rubric` class.** Weighted scoring terms (step penalty, completion, root-cause match, action match) plus an LLM-as-judge `rationale_quality` term that fires on a sampled subset (deterministic on `run_id`) and records its reasoning in trace diagnostics.
-- **AWS deployment via CDK** (under `infra/`). Four stacks — VPC + ECS cluster; S3 + SQS + DDB + KMS + Glue + ECR; env-worker Fargate behind an internal ALB; coordinator Fargate with no inbound surface. `cdk synth` is verified clean.
-
-### What's *not* in the code yet (despite earlier drafts of this README implying otherwise)
-
-- **Concurrent rollouts from a single CLI invocation.** `python main.py rollout` is a sequential `for` loop today. Horizontal scaling via more containers is supported by the architecture, but there's no in-CLI `--concurrency N` flag yet.
-- **`kubectl describe`, `restart`, `rollback`, `page` tools.** A `kubectl_describe.txt` file is generated into each workdir, but no agent tool currently reads it. The mutating tools don't exist.
-- **Bedrock inference, LocalTracer/S3Tracer pluggable storage, ScriptedAgent baseline.** Not implemented; on the roadmap.
-- **Trace upload to the CDK-provisioned S3 bucket.** The CDK stack ships the bucket + Glue catalog; the Python writer puts JSONL on disk locally. Wiring the writer to S3 inside container deployments is roadmap work.
-
-The reward shaping is decomposed into separately-tunable terms specifically so that when an agent learns to cheese one of them you can see *which one* and nerf it. Reward hacking is a sport; the verifier is the goalkeeper.
+**What I learned:** TL;DR this is hard. See [RESEARCH_LOG.md](./RESEARCH_LOG.md) for a running log of my learnings, progress, and design rationale.
 
 See [ARCHITECTURE.md](./ARCHITECTURE.md) for the (separately maintained) design rationale.
+
+## Things this isn't
+
+- A production training environment. The reward function is loud, the task distribution is five hand-tuned templates, and I've trained exactly zero models against this.
+- Original research. The patterns here are stolen, with affection, from Gymnasium, EnvPool, `verifiers`, and the public posts you've all written.
+- Subtle.
+
+## Roadmap (a.k.a. things I would ship if I had more time/sleep/caffeine)
+
+- [x] **Traces for better debugging** this one is obvious
+- [ ] **Token-level trajectories:** IN PROGRESS
+- [ ] **A Rust-based execution path that skips the orchestrator entirely** and drives kernel container primitives directly. Trade Fargate's 5+ second task startup for sub-second cold starts at high concurrency.
+- [x] **Add a defense againt reward hacking**
+- [ ] **In-CLI `--concurrency N` rollout** that fans out across N containers via `asyncio.gather`. The horizontal-scaling path exists (multiple env containers + session tokens) but there's no single-command entry point yet.
+- [ ] **Trainer-side integration** for token-fidelity trajectories: load the `inference.vllm` outputs (token_ids + logprobs already captured) into a PPO/GRPO trainer. The trace schema is ready; the consuming pipeline isn't built.
+- [ ] **Trace upload to S3** from the coordinator container so the CDK-provisioned bucket actually receives traces in production deployments.
+- [ ] **Mutating tools** (`restart`, `rollback`, `page`) and the `kubectl_describe` reader, plus a `ScriptedAgent` baseline so the floor is measurable without burning LLM tokens.
 
 ## Quickstart
 
@@ -144,18 +142,3 @@ For local development without docker:
 uvicorn sregym.server:app --reload --port 8000
 python main.py rollout --env-url http://localhost:8000
 ```
-
-## Things this isn't
-
-- A production training environment. The reward function is loud, the task distribution is five hand-tuned templates, and I've trained exactly zero models against this.
-- Original research. The patterns here are stolen, with affection, from Gymnasium, EnvPool, `verifiers`, and the public posts you've all written.
-- Subtle.
-
-## Roadmap (a.k.a. things I would ship if I had more time/sleep/caffeine)
-
-- **A Rust-based execution path that skips the orchestrator entirely** and drives kernel container primitives directly. Trade Fargate's 5+ second task startup for sub-second cold starts at high concurrency.
-- **In-CLI `--concurrency N` rollout** that fans out across N containers via `asyncio.gather`. The horizontal-scaling path exists (multiple env containers + session tokens) but there's no single-command entry point yet.
-- **Trainer-side integration** for token-fidelity trajectories: load the `inference.vllm` outputs (token_ids + logprobs already captured) into a PPO/GRPO trainer. The trace schema is ready; the consuming pipeline isn't built.
-- **Trace upload to S3** from the coordinator container so the CDK-provisioned bucket actually receives traces in production deployments.
-- **Mutating tools** (`restart`, `rollback`, `page`) and the `kubectl_describe` reader, plus a `ScriptedAgent` baseline so the floor is measurable without burning LLM tokens.
-- **A second env** (terminal-bench-flavored) sharing the same base classes. The whole point of getting the contracts right is that the second one is cheap.
