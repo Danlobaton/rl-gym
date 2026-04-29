@@ -1,6 +1,6 @@
 # Intro
 
-This doc serves as both an intro to the repo architecture as well as learning doc on what I learned about RL environments.
+This doc serves as both an intro to gym architecture as well as the cloud architecture for this gym.
 
 ## Domain model
 

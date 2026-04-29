@@ -2,6 +2,8 @@
 
 This is meant to serve as a runnin log of my research and learnings in the space as I developer the repo. I will do my best to keep it updated.
 
+Goal: Build an SRE Agent training gym
+
 ## First - What even is an RL Gym?
 
 An RL gym (or training environment) is a piece of software that lets an AI agent practice a task. It does four things:
@@ -13,17 +15,6 @@ Presents a problem to the agent
 3. Records what happened so you can train the model to do better next time
 
 The classic example is OpenAI's CartPole environment: a pole balanced on a cart, the agent moves the cart left or right, the reward is "stayed up." That's an RL gym.
-
-For LLM agents the same idea applies but the surface looks different. Instead of a cart with a pole, the "world" is a fake software system — logs, files, APIs. Instead of "move left/right," the agent calls tools. Instead of "stayed up," in my case the reward is "did you diagnose the incident correctly without breaking anything."
-
-Terminology:
-
-- Episode: One start-to-finish run. One incident, from alert to resolution.
-- Rollout: The act of running an episode. "I ran 200 rollouts" = "I did 200 episodes."
-- Trajectory: the sequence of (state, action, reward) tuples produced by an episode. This is what the trainer eventually learns from.
-- Trace: the human-readable log of an episode. Same content as a trajectory, different audience.
-- Reward: the score the agent gets. Higher = better. Can be a single number or a vector of separate concerns. I like to call these brownie points.
-- Verifier (or rubric): the function that computes the reward.
 
 ## Phase 1: The naive in-process gym
 
@@ -44,15 +35,11 @@ The mental model: the Gymnasium contract is really just `reset` and `step`. The 
 
 **The wall I hit:** "I have no idea what is going on and it is a pain to find out why an agent scored so low."
 
-A trace is a structured record of one episode. I needed to move from ad-hoc prints to something I could actually interrogate. Every episode now emits an append-only JSONL record containing the seed, each `(action, observation, reward)` tuple, ground truth, and timing metadata. I also built a `show` command to pretty-print a trace so I could inspect an episode quickly.
+I wired every episode to emit an append-only JSONL trace — seed, `(action, observation, reward)` tuples, ground truth, timing — and wrote a `show` command to pretty-print them. Immediately useful. Then I built `replay`: re-run the env from the same seed, feed the same actions, diff for byte-identical outputs. Every time replay diverged I had a real bug — hidden `random.Random()` usage, dict iteration order assumptions, or wall-clock dependencies. It caught all three.
 
-Then I built a replay command. Given a trace, I re-ran the environment from the same seed, fed the same actions back in, and checked for byte-identical observations and rewards. If replay diverged, the environment was not deterministic and I had a real bug. The root causes were consistently one of three things: hidden `random.Random()` usage, dictionary iteration order assumptions, or wall-clock dependencies.
+For querying I added Hive-style partitions (`agent=X/dt=Y/`). The folder structure is the index, no catalog needed. At scale (~50M files) that makes a diff between scanning 0.1% vs 100% of files, roughly three orders of magnitude in search time. I made this choice on the fly and it held up.
 
-Once I had traces, the next problem was querying them. I added Hive-style partitioning (`agent=X/dt=Y/`) so I could filter without scanning everything. At scale this matters enormously — if you have 50 million trace files spread across two years and ten agents, a query that filters by agent and date might touch 0.1% of them instead of all of them. The cost difference is about three orders of magnitude, both in wall-clock time and in dollars (Athena charges per byte scanned). The convention works because it requires zero metadata infrastructure. No database, no index, no catalog. The folder structure is the index. I made this decision on the fly and it held up.
-
-I also read [Han Lee's taxonomy paper](https://leehanchung.github.io/blogs/2026/03/21/rl-environments-for-llm-agents/), especially the trajectory-vs-trace distinction. What I built was a trace, not a trajectory. A trajectory is what the trainer needs at token level. At this stage, trace quality was the priority. In production systems both are shipped, and ProRL Agent's token-in/token-out design exists because re-tokenizing from string traces introduces drift.
-
-My mental model now: episode records have two first-class consumers — the trainer (token fidelity, optimization correctness) and the human/observability stack (debuggability). I can defer trainer-side sophistication early, but I cannot defer observability and still call the gym usable.
+Reading [Han Lee's taxonomy paper](https://leehanchung.github.io/blogs/2026/03/21/rl-environments-for-llm-agents/) clarified what I'd built: a trace (string-level), not a trajectory (token-level). Trainer-side token fidelity can come later; I can't defer observability and still call the gym usable.
 
 ## Phase 3: File System Materialization
 
@@ -90,5 +77,30 @@ So I looked into how others solved this and found [Prime's write up for Intellec
 
 > While Kubernetes provides the primitives for container management, standard architectural patterns are insufficient for the throughput required by high-velocity training. To overcome these limitations, we built Prime Sandboxes: a fully redesigned, high-performance execution layer that bypasses the Kubernetes control plane, delivers near–local-process latency through a direct Rust-to-pod execution path, achieves sub-10-second startup at massive concurrency.
 
-Interesting.
+Interesting. I would LOVE to take crack at this problem-space on my own but for the sake of this project i'll glost over it.
 
+## Phase 4: The Agent is Cheating
+
+After burning through enough tokens I started actually reading the traces — and that's when I caught the agent cheating. I'd read that reward hacking was a thing, but seeing it happen irl was pretty wild.
+
+Here are three most interesting way I caught Claude cheating:
+
+1. **Skipping the investigation entirely.** My `resolve` reward is `{completion: 0.5, root_cause: ±, action: ±}`. The 0.5 for *completion* fires unconditionally. So the agent learned that calling `resolve` on step 1 with a random guess from the four root causes nets a positive expected return on a quarter of episodes — and the remaining tools cost `-0.02` per step. Reading logs is *literally negative reward* unless it flips your guess. The cheapest policy is "guess fast, never investigate."
+
+2. **Hacking `grep`.** `tail_logs` accepts a `grep` arg that pipes through shell. The agent stopped reading logs and started probing: `grep="oom_killed|bad_deploy|db_pool_exhausted|missing_config"`. Whichever pattern returns hits is the answer — investigation tool repurposed as a one-call label classifier.
+
+3. **Path traversal via `service`.** `log_path = incident.workdir / "logs" / f"{service}.log"` — pathlib doesn't sanitize `..`. So `service="../../ep-{other_seed}/logs/web"` reads a different episode's files. If the eval set lives in the same `/tmp/sregym/` root, the agent could peek at it!!!
+
+So I looked online and I ended up glazing through [Zheng et al. 2023 "Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena"](https://arxiv.org/abs/2306.05685) and [Wang et al. 2026 "LLMs Gaming Verifiers: RLVR Can Lead to Reward Hacking"](https://arxiv.org/abs/2604.15149) I picked up two techniques the field uses to fight this kind of thing:
+
+- **LLM-as-judge** (Zheng 2023): when your rubric term is too fuzzy for `==` — like "did the rationale actually cite evidence, or is this confabulation?" — you delegate the scoring to another LLM. Takeaway: it works (~80% agreement with human raters, on par with inter-human agreement), but the paper is just as important for cataloguing the biases — position bias, verbosity bias, self-enhancement bias when the judge and the agent share a model family. Don't trust judge scores as ground truth; calibrate them.
+
+- **Isomorphic perturbation** (Wang 2026): take a successful trace, perturb a surface detail of the task that shouldn't change the answer (rename the affected service, swap a number), re-score under the perturbed task. If the score holds, the agent was solving the underlying problem. If it drops, the agent was riding a surface feature. Takeaway: rewards alone can't tell you whether high scores were earned or structural — perturbation is what makes the difference visible. The paper formalizes this for inductive reasoning; for SRE I'm using a looser version, same intuition.
+
+So the LLM judge is the lever I pulled against cheat #1, and isomorphic perturbation is what I used to fight cheats #2 and #3. (Now I really want to see an LLM cheating its way through GTA 6 — if it ever comes out.)
+
+BUT, I am obviously to training the weights of a frontier model so implementing isomorphic perturbation doesn't really make sense in this instance. It is still worth recognizing as a technique against reward hacking.
+
+### Results
+
+The results were definitely not half bad. A few things I found. The LLM judge works much better when it's from a different model family than the agent it's judging — ideally a different family altogether. Opus judging Opus is biased; Opus judging Sonnet is much better. GPT 5.3 judging Opus 4.6 is better still.
