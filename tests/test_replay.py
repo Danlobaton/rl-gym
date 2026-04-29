@@ -4,6 +4,7 @@ Replay catches the bug class that breaks every downstream system silently
 (eval harnesses, trainers, reward analyses). These tests lock that contract
 in: any change that makes the env nondeterministic should fail one of these.
 """
+import asyncio
 import tempfile
 import time
 from dataclasses import asdict
@@ -11,6 +12,7 @@ from dataclasses import asdict
 from sregym.trace import Trace, TraceStep, read_trace, write_trace
 from sregym.env import IncidentEnv
 from sregym.replay import excerpt, first_diff_index, replay_trace
+from sregym.rubric import default_rubric
 
 
 def make_trace(seed: int = 7) -> Trace:
@@ -37,14 +39,21 @@ def make_trace(seed: int = 7) -> Trace:
         if r.terminated or r.truncated:
             break
     now = time.time()
+    gt = steps[-1].info.get("ground_truth", {})
+    # judge_sample_rate=0 — tests should not call the LLM judge.
+    rubric = default_rubric(judge_sample_rate=0)
+    total_reward, breakdown, diagnostics = asyncio.run(
+        rubric.score([asdict(s) for s in steps], gt)
+    )
     return Trace(
-        schema_version="1.1", run_id="test", run_started_at=now,
+        schema_version="1.2", run_id="test", run_started_at=now,
         agent_name="dummy", agent_config={},
         seed=seed, task_meta={"incident_type": env.incident.incident_type},
-        steps=steps, total_reward=sum(s.reward for s in steps),
-        reward_breakdown=steps[-1].info.get("breakdown", {}),
-        ground_truth=steps[-1].info.get("ground_truth", {}),
+        steps=steps, total_reward=total_reward,
+        reward_breakdown=breakdown,
+        ground_truth=gt,
         started_at=now, ended_at=now,
+        diagnostics=diagnostics,
     )
 
 

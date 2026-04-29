@@ -219,3 +219,11 @@ __marimo__/
 
 # Local trace storage
 traces/
+
+
+node_modules/
+cdk.out/
+*.js
+*.d.ts
+!bin/app.d.ts
+.env
