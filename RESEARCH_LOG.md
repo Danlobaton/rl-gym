@@ -58,28 +58,37 @@ My mental model now: episode records have two first-class consumers — the trai
 
 **The wall I hit:** "I can't ship a real subprocess sandbox without files on disk."
 
-The previous naive gym kept incidents in-memory: I hardcoded `INCIDENTS` list of dataclass instances that the env picked from on `reset()`. That worked for the in-process loop, but it blocked the next thing on the roadmap — having tools shell out to real Unix utilities (`tail`, `cat`, `grep`) against synthetic logs and metrics. You can't `tail -n 50 logs/payments-api.log` if there's no file.
+Tools need to shell out to `tail`, `grep`, etc., so incidents moved from in-memory dataclasses to a per-episode workdir (`/tmp/sregym/ep-<seed>/`) containing logs, metric CSVs, and a kubectl-describe blob. Two invariants: (1) same seed → byte-identical workdir (keeps replay working), and (2) file contents are causally consistent with the hidden root cause so the agent reasons from evidence, not canned strings.
 
-So this phase moves materialized state from Python lists to actual files in a per-episode workdir.
+Determinism uses `subrng(parent, label)` — SHA-256-derived child RNGs namespaced by label — so adding or reordering generation steps doesn't shift downstream draws. Per-seed workdir naming gives free isolation for concurrent episodes and a convenient debugging surface (`ls /tmp/sregym/ep-47/`).
 
-**The contract.** Every seed produces a workdir at `/tmp/sregym/ep-<seed>/` containing:
+## Phase 5: (Stupidly) Scaling
 
-- `logs/<service>.log` — plain text, one log line per entry
-- `metrics/<metric>.csv` — `t,value` time series
-- `kubectl_describe.txt` — pod-status blob
+This is where my laptop officially gave out. I tried running (stupidly, because I was curious on what would happen)
 
-Two design considerations:
+```bash
+for i in $(seq 0 79); do
+    docker run --rm --memory 512m --cpus 1 -e ANTHROPIC_API_KEY \
+        -v $(pwd)/traces:/app/traces rl_gym:dev \
+        rollout --agent llm --episodes 1 --seed-start $i &
+done
+```
 
-1. **Deterministic from seed.** Same seed → byte-identical workdir contents. This is what keeps `replay` working: env outputs are still a pure function of (seed, action sequence). The replay test suite caught one non-deterministic-looking moment during development (a `random.shuffle` on a list whose iteration order I'd assumed was stable); it surfaced as a single test failure with a clear MISMATCH line, which is exactly what that infrastructure exists for.
-2. **Causally consistent with the hidden root cause.** If the root cause is `oom_killed`, the memory metric climbs to its limit and the logs cut off mid-write. If it's `bad_deploy`, errors spike right after a deploy event in the logs. The agent has to reason from real evidence, not pattern-match on canned strings.
+Care to say... my laptop did not like that.
 
-**Determinism via sub-rng composition.** Naive determinism is "one seed, threaded through all generation calls in order." It works until you reorder generation steps (or add a new one) and every downstream draw shifts. Refactor-fragile, exactly the kind of trap that makes determinism feel like luck rather than a property.
+**The wall I hit:** "I am spending more resources managing and bookkeping my containers than actually running those containers"
 
-Instead, generation uses a `subrng(parent, label)` helper that derives a child RNG from a parent (seed-or-RNG), namespaced by a string label. It hashes `(parent_state, label) → SHA-256 → child seed`. Three properties make this safe:
+But granted, here are some of the issues I saw that I think could really bite when scaling in prod workloads:
 
-**Why the workdir is per-episode and seed-named.** Two reasons.
+- **Control-plane serialization.** Docker daemon and K8s API server are the same bottleneck shape — one serialization point processing every container request. Cloud raises the ceiling (50 → 1000 containers/sec) but doesn't remove it.
+- **Per-container creation cost.** cgroups, namespaces, mounts — that's kernel work. Same cost per container on a laptop or a cloud node; cloud just gives you more nodes to parallelize across.
+- **Image pull & warm-up.** Cold pull + Python interpreter startup takes 1-2s whether it's local or Fargate. No free lunch.
 
-First, when episodes run concurrently later, each one needs its own filesystem so they don't trample each other's state. Naming the dir after the seed gives that for free — concurrent episodes have different seeds, therefore different dirs.
+So if you have a frontier lab running GPUs that cost $2-4/hour each, running by the 1,000s. The training pipeline looks like `env containers → trajectories → trainer GPUs consume them`. If env containers can't keep up, the trainer GPUs sit idle, which is essentially lighting money on fire. So the real value is "how many trajectories per second can you deliver to a trainer."
 
-Second, materialized state is a debugging surface. If you ever want to know "what did the agent see in episode 47?", you can `ls /tmp/sregym/ep-47/` and inspect the actual files. No need to instrument the env or replay anything.
+So I looked into how others solved this and found [Prime's write up for Intellect-3](https://www.primeintellect.ai/blog/intellect-3):
+
+> While Kubernetes provides the primitives for container management, standard architectural patterns are insufficient for the throughput required by high-velocity training. To overcome these limitations, we built Prime Sandboxes: a fully redesigned, high-performance execution layer that bypasses the Kubernetes control plane, delivers near–local-process latency through a direct Rust-to-pod execution path, achieves sub-10-second startup at massive concurrency.
+
+Interesting.
 

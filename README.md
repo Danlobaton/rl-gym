@@ -43,7 +43,7 @@ The reward shaping is decomposed into separately-tunable terms specifically so t
 ## Quickstart
 
 ```bash
-pip install -r requirements.txt
+pip install -e '.[coordinator]'
 export ANTHROPIC_API_KEY=sk-ant-...   # or drop it in a .env at the repo root
 
 # Run 5 rollouts (default) and write traces to ./traces/
@@ -106,6 +106,38 @@ python main.py replay audit
 
 Replay verifies the env, not the agent. The LLM is allowed to be stochastic;
 the env must be a pure function of (seed, action sequence).
+
+### Run the env as a container — `env_server`
+
+Per OpenEnv, the env can run as a FastAPI service inside a container; the
+coordinator (this CLI) calls `/reset` and `/step` over HTTP. One container =
+one episode at a time; scale horizontally by running multiple containers.
+
+```bash
+# Build the slim env image (no anthropic, no agent code — env only)
+docker build -t sregym-env .
+
+# Run it on :8000
+docker run --rm -p 8000:8000 sregym-env
+
+# In another terminal: rollout against the container
+python main.py rollout --episodes 5 --env-url http://localhost:8000
+```
+
+Endpoints:
+
+| Method | Path     | Body                     | Response                                                      |
+|--------|----------|--------------------------|---------------------------------------------------------------|
+| GET    | /health  | —                        | `{"status": "ok"}`                                            |
+| POST   | /reset   | `{"seed": N}`            | `{"observation": str, "info": {seed, incident_type}}`         |
+| POST   | /step    | `{"action": {...}}`      | `{"observation, reward, terminated, truncated, info"}`        |
+
+For local development without docker:
+
+```bash
+uvicorn sregym.server:app --reload --port 8000
+python main.py rollout --env-url http://localhost:8000
+```
 
 ## Things this isn't
 

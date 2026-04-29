@@ -13,9 +13,18 @@ import csv
 import hashlib
 import random
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 
-from incidents import Incident
+
+@dataclass
+class Incident:
+    incident_type: str
+    affected_service: str
+    alert_text: str
+    root_cause: str # the root cause of the incident e.g. "oomkilled"
+    correct_action: str  # the correct action to take to resolve the incident
+    workdir: Path  # per-episode dir; tools shell out against logs/, metrics/, kubectl_describe.txt
 
 
 def subrng(parent: int | str | random.Random, label: str) -> random.Random:
@@ -74,6 +83,11 @@ SERVICES = (
 
 def generate_incident(seed: int, base_dir: Path) -> Incident:
     """Generate an incident's materialized state into base_dir/ep-<seed>/."""
+    # Wipe ALL prior episode workdirs so /tmp/sregym/ doesn't accumulate
+    # ep-*/ dirs forever across resets with different seeds.
+    if base_dir.exists():
+        for p in base_dir.glob("ep-*"):
+            shutil.rmtree(p, ignore_errors=True)
     workdir = base_dir / f"ep-{seed}"
     if workdir.exists():
         shutil.rmtree(workdir)

@@ -1,15 +1,20 @@
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Protocol
 
 from anthropic import Anthropic
 from anthropic.types import MessageParam, TextBlock
 from dotenv import load_dotenv
 import json, re, os, time
 
-from gym import IncidentEnv
-from episode_trace import Trace, TraceStep
+from .trace import Trace, TraceStep
+from .env import StepResult
 
-load_dotenv(Path(__file__).resolve().parent / ".env")
+
+class EnvProtocol(Protocol):
+    def reset(self, seed: int) -> tuple[str, dict]: ...
+    def step(self, action: dict) -> "StepResult": ...
+
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 
 def _message(role: Literal["user", "assistant"], content: str) -> MessageParam:
@@ -30,12 +35,13 @@ DEFAULT_MAX_TOKENS = 512
 
 
 def run_episode(
-    env: IncidentEnv,
+    env: EnvProtocol,
     seed: int,
     run_id: str,
     run_started_at: float,
     model: str = DEFAULT_MODEL,
     max_tokens: int = DEFAULT_MAX_TOKENS,
+    env_url: str | None = None,
 ) -> Trace:
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
@@ -90,9 +96,9 @@ def run_episode(
         run_id=run_id,
         run_started_at=run_started_at,
         agent_name=model,
-        agent_config={"model": model, "max_tokens": max_tokens},
+        agent_config={"model": model, "max_tokens": max_tokens, "env_url": env_url},
         seed=seed,
-        task_meta={"incident_type": env.incident.incident_type},
+        task_meta={"incident_type": reset_info.get("incident_type", "")},
         steps=steps,
         total_reward=total_reward,
         reward_breakdown=final_info.get("breakdown", {}),

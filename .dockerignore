@@ -1,0 +1,12 @@
+__pycache__
+*.pyc
+.pytest_cache
+.venv
+venv
+.env
+traces/
+tests/
+RESEARCH_LOG.md
+README.md
+ARCHITECTURE.md
+.git
