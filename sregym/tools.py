@@ -55,9 +55,3 @@ def query_metrics(incident: Incident, service: str, metric: str) -> str:
     return _sh(cmd)
 
 
-def resolve(incident: Incident, root_cause: str, action: str) -> tuple[float, dict]:
-    """Resolve the incident by calling the correct action to resolve the incident."""
-    breakdown = {"completion": 0.5, "root_cause": 0.0, "action": 0.0}
-    breakdown["root_cause"] = 1.5 if root_cause == incident.root_cause else -1.0
-    breakdown["action"] = 1.0 if action == incident.correct_action else -0.5
-    return sum(breakdown.values()), breakdown

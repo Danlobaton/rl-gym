@@ -1,3 +1,4 @@
+from dataclasses import asdict
 from pathlib import Path
 from typing import Literal, Protocol
 
@@ -8,6 +9,7 @@ import json, re, os, time
 
 from .trace import Trace, TraceStep
 from .env import StepResult
+from .rubric import Rubric, default_rubric
 
 
 class EnvProtocol(Protocol):
@@ -34,7 +36,7 @@ DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_MAX_TOKENS = 512
 
 
-def run_episode(
+async def run_episode(
     env: EnvProtocol,
     seed: int,
     run_id: str,
@@ -42,6 +44,7 @@ def run_episode(
     model: str = DEFAULT_MODEL,
     max_tokens: int = DEFAULT_MAX_TOKENS,
     env_url: str | None = None,
+    rubric: Rubric | None = None,
 ) -> Trace:
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
@@ -50,12 +53,13 @@ def run_episode(
             "or run: export ANTHROPIC_API_KEY=..."
         )
     client = Anthropic(api_key=api_key)
+    if rubric is None:
+        rubric = default_rubric()
 
     started = time.time()
     obs, reset_info = env.reset(seed)
     history: list[MessageParam] = [_message("user", obs)]
     steps: list[TraceStep] = []
-    total_reward = 0.0
     final_info: dict = {}
 
     t = 0
@@ -82,7 +86,6 @@ def run_episode(
             t=t, action=action, observation=result.observation,
             reward=result.reward, info=result.info, latency_ms=latency_ms,
         ))
-        total_reward += result.reward
         t += 1
 
         if result.terminated or result.truncated:
@@ -91,8 +94,27 @@ def run_episode(
 
         history.append(_message("user", result.observation))
 
+    # Episode-level scoring: rubric reads the completed trajectory + ground truth.
+    # Augment ground_truth with affected_service so the LLM-judge can locate the
+    # right log file in the workdir; pulled from reset_info, not env terminal info,
+    # so this is purely additive and doesn't affect replay's per-step info checks.
+    ground_truth = dict(final_info.get("ground_truth", {}))
+    if reset_info.get("affected_service"):
+        ground_truth["affected_service"] = reset_info["affected_service"]
+
+    # Workdir is in-process-only — EnvClient (HTTP) doesn't expose .incident,
+    # so getattr returns None and the judge skips gracefully.
+    workdir = getattr(getattr(env, "incident", None), "workdir", None)
+
+    total_reward, breakdown, diagnostics = await rubric.score(
+        [asdict(s) for s in steps],
+        ground_truth,
+        run_id=run_id,
+        workdir=workdir,
+    )
+
     return Trace(
-        schema_version="1.1",
+        schema_version="1.2",
         run_id=run_id,
         run_started_at=run_started_at,
         agent_name=model,
@@ -101,10 +123,11 @@ def run_episode(
         task_meta={"incident_type": reset_info.get("incident_type", "")},
         steps=steps,
         total_reward=total_reward,
-        reward_breakdown=final_info.get("breakdown", {}),
-        ground_truth=final_info.get("ground_truth", {}),
+        reward_breakdown=breakdown,
+        ground_truth=ground_truth,
         started_at=started,
         ended_at=time.time(),
+        diagnostics=diagnostics,
     )
 
 

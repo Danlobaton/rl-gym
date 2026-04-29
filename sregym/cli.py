@@ -6,9 +6,11 @@ from pathlib import Path
 
 
 def cmd_rollout(args: argparse.Namespace) -> None:
+    import asyncio
     from contextlib import nullcontext
 
     from .agent import run_episode  # lazy: avoids loading anthropic for read-only commands
+    from .rubric import default_rubric
     from .trace import write_trace
 
     env_url = args.env_url
@@ -19,21 +21,27 @@ def cmd_rollout(args: argparse.Namespace) -> None:
         from .env import IncidentEnv
         env_cm = nullcontext(IncidentEnv())
 
+    # One rubric across the whole rollout — caches the AsyncAnthropic client so
+    # we don't spin up a fresh httpx connection pool per episode.
+    rubric = default_rubric()
     run_id = uuid.uuid4().hex[:12]
     run_started_at = time.time()
     with env_cm as env:
         for seed in range(args.episodes):
-            trace = run_episode(
+            trace = asyncio.run(run_episode(
                 env,
                 seed,
                 run_id=run_id,
                 run_started_at=run_started_at,
                 env_url=env_url,
-            )
+                rubric=rubric,
+            ))
             path = write_trace(trace)
+            judged = trace.diagnostics.get("judge_ran", False)
+            judge_note = f"  judge={trace.diagnostics.get('judge_raw_score'):.2f}" if judged else ""
             print(
                 f"seed={seed} reward={trace.total_reward:+.2f} "
-                f"steps={len(trace.steps)} run_id={trace.run_id} -> {path}"
+                f"steps={len(trace.steps)} run_id={trace.run_id}{judge_note} -> {path}"
             )
 
 

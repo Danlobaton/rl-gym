@@ -14,7 +14,7 @@ class TraceStep:
 
 @dataclass
 class Trace:
-    schema_version: str # "1.1" — bump on incompatible change
+    schema_version: str # "1.2" — bump on incompatible change
     run_id: str # shared across all episodes in one rollout invocation
     run_started_at: float # UTC unix timestamp; shared across the run, drives partition path
     agent_name: str
@@ -27,6 +27,7 @@ class Trace:
     ground_truth: dict
     started_at: float
     ended_at: float
+    diagnostics: dict = field(default_factory=dict)  # rubric metadata: judge sampling, etc.
 
 
 def write_trace(trace: Trace, root: Path | str = "traces") -> Path:
