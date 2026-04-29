@@ -83,6 +83,6 @@ class IncidentEnv:
 
         Tools available:
         tail_logs(service, lines=50)
-        query_metrics(service, metric)
+        query_metrics(metric)
         resolve(root_cause, action)
         """

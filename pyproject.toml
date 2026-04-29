@@ -18,8 +18,15 @@ coordinator = [
     "python-dotenv>=1.0.0",
     "httpx>=0.25",
 ]
+# `inference` extra: backends that expose token IDs + logprobs (RL training).
+# transformers is heavy — only pull in when you actually need vLLM rollouts.
+inference = [
+    "transformers>=4.40",
+    "httpx>=0.25",
+]
 dev = [
     "sregym[coordinator]",
+    "sregym[inference]",
     "pytest>=7.0",
 ]
 
@@ -27,10 +34,10 @@ dev = [
 sregym = "sregym.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["sregym*"]
+include = ["sregym*", "inference*"]
 
 [tool.pyright]
-include = ["sregym", "tests"]
+include = ["sregym", "inference", "tests"]
 typeCheckingMode = "basic"
 venvPath = "."
 venv = ".venv"

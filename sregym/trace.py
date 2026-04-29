@@ -11,10 +11,16 @@ class TraceStep:
     reward: float
     info: dict = field(default_factory=dict)
     latency_ms: int = 0
+    # --- Token-level fields (schema 1.3+). None when the inference backend
+    # can't supply them (e.g., Anthropic API). For RL training, all three
+    # MUST be populated — see inference/vllm.py.
+    prompt_tokens: list[int] | None = None     # token IDs the model saw (post chat-template)
+    output_tokens: list[int] | None = None     # token IDs the model produced
+    output_logprobs: list[float] | None = None # log P(token_t | prefix) under the policy
 
 @dataclass
 class Trace:
-    schema_version: str # "1.2" — bump on incompatible change
+    schema_version: str # "1.3" — bump on incompatible change
     run_id: str # shared across all episodes in one rollout invocation
     run_started_at: float # UTC unix timestamp; shared across the run, drives partition path
     agent_name: str
@@ -28,6 +34,13 @@ class Trace:
     started_at: float
     ended_at: float
     diagnostics: dict = field(default_factory=dict)  # rubric metadata: judge sampling, etc.
+    # --- Trajectory-level token-fidelity metadata (schema 1.3+). Pinning these
+    # lets a future trainer detect tokenizer/weight drift across runs — silent
+    # drift is the most common source of mysteriously-broken RL training.
+    policy_model: str = ""               # exact model identifier (e.g. "meta-llama/Llama-3.1-8B-Instruct")
+    policy_model_revision: str = ""      # git/HF commit SHA — pins the weights
+    tokenizer_hash: str = ""             # fingerprint of the tokenizer's vocab + special tokens
+    sampling_params: dict = field(default_factory=dict)  # {temperature, top_p, max_tokens}
 
 
 def write_trace(trace: Trace, root: Path | str = "traces") -> Path:

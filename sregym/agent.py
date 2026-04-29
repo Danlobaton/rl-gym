@@ -1,11 +1,11 @@
 from dataclasses import asdict
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Protocol
 
-from anthropic import Anthropic
-from anthropic.types import MessageParam, TextBlock
 from dotenv import load_dotenv
-import json, re, os, time
+import json, re, time
+
+from inference import InferenceClient
 
 from .trace import Trace, TraceStep
 from .env import StepResult
@@ -19,9 +19,6 @@ class EnvProtocol(Protocol):
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 
-def _message(role: Literal["user", "assistant"], content: str) -> MessageParam:
-    return {"role": role, "content": content}
-
 SYSTEM_PROMPT = """You are an SRE incident triage agent. Investigate the alert
 using read-only tools, then call resolve(root_cause, action).
 
@@ -32,8 +29,14 @@ Respond ONLY with a JSON object: {"tool": "...", "args": {...}}
 """
 
 
-DEFAULT_MODEL = "claude-sonnet-4-6"
-DEFAULT_MAX_TOKENS = 512
+def _default_inference() -> InferenceClient:
+    """Backwards-compat default: Anthropic with the original demo settings.
+
+    Production / RL-training rollouts inject a VllmClient explicitly so the
+    trace captures token IDs + logprobs.
+    """
+    from inference.anthropic_client import AnthropicClient
+    return AnthropicClient()
 
 
 async def run_episode(
@@ -41,24 +44,23 @@ async def run_episode(
     seed: int,
     run_id: str,
     run_started_at: float,
-    model: str = DEFAULT_MODEL,
-    max_tokens: int = DEFAULT_MAX_TOKENS,
     env_url: str | None = None,
     rubric: Rubric | None = None,
+    inference: InferenceClient | None = None,
 ) -> Trace:
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise RuntimeError(
-            "ANTHROPIC_API_KEY is not set. Put it in a .env file in the project root "
-            "or run: export ANTHROPIC_API_KEY=..."
-        )
-    client = Anthropic(api_key=api_key)
+    if inference is None:
+        inference = _default_inference()
     if rubric is None:
         rubric = default_rubric()
 
     started = time.time()
     obs, reset_info = env.reset(seed)
-    history: list[MessageParam] = [_message("user", obs)]
+    # Single-history shape that every backend understands; AnthropicClient
+    # strips the system message and remaps to its native format internally.
+    history: list[dict] = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": obs},
+    ]
     steps: list[TraceStep] = []
     final_info: dict = {}
 
@@ -66,25 +68,26 @@ async def run_episode(
     while True:
         step_started = time.time()
 
-        resp = client.messages.create(
-            model=model,
-            max_tokens=max_tokens,
-            system=SYSTEM_PROMPT,
-            messages=history,
-        )
-        block0 = resp.content[0]
-        if not isinstance(block0, TextBlock):
-            raise TypeError(f"expected model text block, got {type(block0).__name__}")
-        text = block0.text
-        history.append(_message("assistant", text))
+        resp = await inference.chat(history)
+        text = resp.text
+        history.append({"role": "assistant", "content": text})
 
         action = parse_action(text)
         result = env.step(action)
         latency_ms = int((time.time() - step_started) * 1000)
 
         steps.append(TraceStep(
-            t=t, action=action, observation=result.observation,
-            reward=result.reward, info=result.info, latency_ms=latency_ms,
+            t=t,
+            action=action,
+            observation=result.observation,
+            reward=result.reward,
+            info=result.info,
+            latency_ms=latency_ms,
+            # Token fields flow through unchanged: None for closed APIs,
+            # populated for vLLM/SGLang/TGI. The trainer reads these directly.
+            prompt_tokens=resp.prompt_tokens,
+            output_tokens=resp.output_tokens,
+            output_logprobs=resp.output_logprobs,
         ))
         t += 1
 
@@ -92,7 +95,7 @@ async def run_episode(
             final_info = result.info
             break
 
-        history.append(_message("user", result.observation))
+        history.append({"role": "user", "content": result.observation})
 
     # Episode-level scoring: rubric reads the completed trajectory + ground truth.
     # Augment ground_truth with affected_service so the LLM-judge can locate the
@@ -113,12 +116,28 @@ async def run_episode(
         workdir=workdir,
     )
 
+    # Pull tokenizer fingerprint + sampling params from the inference client.
+    # Both are best-effort — only vLLM-style backends populate them; closed
+    # APIs leave them empty so the trace honestly says "this isn't trainable."
+    tokenizer_hash = ""
+    sampling_params: dict = {}
+    if hasattr(inference, "tokenizer_hash"):
+        try:
+            tokenizer_hash = inference.tokenizer_hash()
+        except Exception:
+            tokenizer_hash = ""
+    if hasattr(inference, "temperature") and hasattr(inference, "max_tokens"):
+        sampling_params = {
+            "temperature": getattr(inference, "temperature", None),
+            "max_tokens": getattr(inference, "max_tokens", None),
+        }
+
     return Trace(
-        schema_version="1.2",
+        schema_version="1.3",
         run_id=run_id,
         run_started_at=run_started_at,
-        agent_name=model,
-        agent_config={"model": model, "max_tokens": max_tokens, "env_url": env_url},
+        agent_name=getattr(inference, "model", "unknown"),
+        agent_config={"model": getattr(inference, "model", "unknown"), "env_url": env_url},
         seed=seed,
         task_meta={"incident_type": reset_info.get("incident_type", "")},
         steps=steps,
@@ -128,6 +147,10 @@ async def run_episode(
         started_at=started,
         ended_at=time.time(),
         diagnostics=diagnostics,
+        policy_model=getattr(inference, "model", ""),
+        policy_model_revision="",  # populated when vLLM exposes it; out of Phase 0 scope
+        tokenizer_hash=tokenizer_hash,
+        sampling_params=sampling_params,
     )
 
 

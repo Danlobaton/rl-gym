@@ -39,7 +39,7 @@ def tail_logs(incident: Incident, service: str, lines: int = 50, grep: str | Non
     return _sh(cmd)
 
 
-def query_metrics(incident: Incident, service: str, metric: str) -> str:
+def query_metrics(incident: Incident, metric: str) -> str:
     """tail -n +2 metrics/{metric}.csv | awk -F, '{print "t="$1" value="$2}'
 
     The awk pipe reformats CSV rows back into the legacy `t=N value=V` shape so
