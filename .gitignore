@@ -227,3 +227,4 @@ cdk.out/
 *.d.ts
 !bin/app.d.ts
 .env
+!infra/lib/
