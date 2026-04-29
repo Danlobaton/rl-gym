@@ -104,3 +104,7 @@ BUT, I am obviously to training the weights of a frontier model so implementing 
 ### Results
 
 The results were definitely not half bad. A few things I found. The LLM judge works much better when it's from a different model family than the agent it's judging — ideally a different family altogether. Opus judging Opus is biased; Opus judging Sonnet is much better. GPT 5.3 judging Opus 4.6 is better still.
+
+## Phase 5: Token-Level Trajectories
+
+So I have implemented traces, but that is essentially usesless during RL training. Traces are for my own debugging. Now I need token-level trajectories that can be useful during training. Now it is time to swap inference with an open weight server with vLLM or SGLang.
