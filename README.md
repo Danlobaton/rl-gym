@@ -1,6 +1,6 @@
 # Stupid Simple RL Gym
 
-> Sometimes this repo, some times it doesn't. I am constantly experiementing with it and breaking it.
+> Sometimes this repo works, sometimes it doesn’t. I’m constantly experimenting with it and breaking it.
 
 > Funny story: When I told my my mom I was making an AI gym she thought I meant an AI powered workout app.
 
