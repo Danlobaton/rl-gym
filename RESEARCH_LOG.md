@@ -1,6 +1,6 @@
 # Research Log
 
-This is meant to serve as a runnin log of my research and progress in the space. I will do my best to keep it
+This is meant to serve as a runnin log of my research and learnings in the space as I developer the repo. I will do my best to keep it updated.
 
 ## First - What even is an RL Gym?
 
@@ -54,4 +54,32 @@ I also read [Han Lee's taxonomy paper](https://leehanchung.github.io/blogs/2026/
 
 My mental model now: episode records have two first-class consumers — the trainer (token fidelity, optimization correctness) and the human/observability stack (debuggability). I can defer trainer-side sophistication early, but I cannot defer observability and still call the gym usable.
 
-# Phase 3: File System Materialization
+## Phase 3: File System Materialization
+
+**The wall I hit:** "I can't ship a real subprocess sandbox without files on disk."
+
+The previous naive gym kept incidents in-memory: I hardcoded `INCIDENTS` list of dataclass instances that the env picked from on `reset()`. That worked for the in-process loop, but it blocked the next thing on the roadmap — having tools shell out to real Unix utilities (`tail`, `cat`, `grep`) against synthetic logs and metrics. You can't `tail -n 50 logs/payments-api.log` if there's no file.
+
+So this phase moves materialized state from Python lists to actual files in a per-episode workdir.
+
+**The contract.** Every seed produces a workdir at `/tmp/sregym/ep-<seed>/` containing:
+
+- `logs/<service>.log` — plain text, one log line per entry
+- `metrics/<metric>.csv` — `t,value` time series
+- `kubectl_describe.txt` — pod-status blob
+
+Two design considerations:
+
+1. **Deterministic from seed.** Same seed → byte-identical workdir contents. This is what keeps `replay` working: env outputs are still a pure function of (seed, action sequence). The replay test suite caught one non-deterministic-looking moment during development (a `random.shuffle` on a list whose iteration order I'd assumed was stable); it surfaced as a single test failure with a clear MISMATCH line, which is exactly what that infrastructure exists for.
+2. **Causally consistent with the hidden root cause.** If the root cause is `oom_killed`, the memory metric climbs to its limit and the logs cut off mid-write. If it's `bad_deploy`, errors spike right after a deploy event in the logs. The agent has to reason from real evidence, not pattern-match on canned strings.
+
+**Determinism via sub-rng composition.** Naive determinism is "one seed, threaded through all generation calls in order." It works until you reorder generation steps (or add a new one) and every downstream draw shifts. Refactor-fragile, exactly the kind of trap that makes determinism feel like luck rather than a property.
+
+Instead, generation uses a `subrng(parent, label)` helper that derives a child RNG from a parent (seed-or-RNG), namespaced by a string label. It hashes `(parent_state, label) → SHA-256 → child seed`. Three properties make this safe:
+
+**Why the workdir is per-episode and seed-named.** Two reasons.
+
+First, when episodes run concurrently later, each one needs its own filesystem so they don't trample each other's state. Naming the dir after the seed gives that for free — concurrent episodes have different seeds, therefore different dirs.
+
+Second, materialized state is a debugging surface. If you ever want to know "what did the agent see in episode 47?", you can `ls /tmp/sregym/ep-47/` and inspect the actual files. No need to instrument the env or replay anything.
+

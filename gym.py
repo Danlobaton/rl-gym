@@ -1,7 +1,14 @@
+import shlex
+import subprocess
 from dataclasses import dataclass
-import random
+from pathlib import Path
 
-from incidents import INCIDENTS, Incident
+from incident_generator import generate_incident
+from incidents import Incident
+
+WORKDIR_ROOT = Path("/tmp/sregym")
+TOOL_TIMEOUT_S = 5
+
 
 @dataclass
 class StepResult:
@@ -11,38 +18,69 @@ class StepResult:
     truncated: bool # episode hit the step limit
     info: dict # contains debugging, ground truth, etc.
 
-# Tools
-def tail_logs(incident: Incident, service: str, lines: int = 50) -> str:
-    if service not in incident.logs:
+
+def _sh(cmd: str) -> str:
+    """Run a shell command, return stdout with trailing newline trimmed.
+
+    shell=True is intentional — pipes (`tail | grep`, `tail | awk`) are part of
+    the tool surface. The trade-off: every interpolated arg must pass through
+    shlex.quote so adversarial agent input can't break out of its slot.
+    """
+    result = subprocess.run(
+        cmd, shell=True, capture_output=True, text=True, timeout=TOOL_TIMEOUT_S
+    )
+    return result.stdout.rstrip("\n")
+
+
+def tail_logs(incident: Incident, service: str, lines: int = 50, grep: str | None = None) -> str:
+    """tail -n {lines} logs/{service}.log [| grep -- {pattern}]"""
+    log_path = incident.workdir / "logs" / f"{service}.log"
+    if not log_path.exists():
         return f"ERROR: no log file for {service}"
-    return "\n".join(incident.logs[service][-lines:])
+    try:
+        n = int(lines)  # int cast neutralizes any shell metachars in `lines`
+    except (TypeError, ValueError):
+        return f"ERROR: invalid lines argument: {lines!r}"
+
+    cmd = f"tail -n {n} {shlex.quote(str(log_path))}"
+    if grep:
+        # `--` so a pattern starting with `-` isn't parsed as a flag
+        cmd += f" | grep -- {shlex.quote(str(grep))}"
+    return _sh(cmd)
+
 
 def query_metrics(incident: Incident, service: str, metric: str) -> str:
-    if metric not in incident.metrics:
+    """tail -n +2 metrics/{metric}.csv | awk -F, '{print "t="$1" value="$2}'
+
+    The awk pipe reformats CSV rows back into the legacy `t=N value=V` shape so
+    replay traces written before this rewrite still match byte-for-byte.
+    """
+    csv_path = incident.workdir / "metrics" / f"{metric}.csv"
+    if not csv_path.exists():
         return f"ERROR: metric {metric} not found"
-    values = incident.metrics[metric]
-    return "\n".join(f"t={i} value={v}" for i, v in enumerate(values))
+    cmd = (
+        f"tail -n +2 {shlex.quote(str(csv_path))} "
+        f"| awk -F, '{{print \"t=\"$1\" value=\"$2}}'"
+    )
+    return _sh(cmd)
 
 
 def resolve(incident: Incident, root_cause: str, action: str) -> tuple[float, dict]:
     """Resolve the incident by calling the correct action to resolve the incident."""
     breakdown = {"completion": 0.5, "root_cause": 0.0, "action": 0.0}
-    if root_cause == incident.root_cause:
-        breakdown["root_cause"] = 1.5
-    else:
-        breakdown["root_cause"] = -1.0
-    if action == incident.correct_action:
-        breakdown["action"] = 1.0
-    else:
-        breakdown["action"] = -0.5
+    breakdown["root_cause"] = 1.5 if root_cause == incident.root_cause else -1.0
+    breakdown["action"] = 1.0 if action == incident.correct_action else -0.5
     return sum(breakdown.values()), breakdown
+
 
 class IncidentEnv:
     MAX_STEPS = 10
 
     def reset(self, seed: int):
-        rng = random.Random(seed)
-        self.incident = rng.choice(INCIDENTS)
+        # generate_incident wipes any prior workdir at WORKDIR_ROOT/ep-<seed>/
+        # before regenerating — idempotent, so a crashed episode doesn't leak
+        # state into the next reset.
+        self.incident = generate_incident(seed, WORKDIR_ROOT)
         self.step_count = 0
         self.done = False # This is internal environment state, not part of the API
         obs = self._render_alert()
@@ -67,7 +105,6 @@ class IncidentEnv:
                 }},
             )
 
-        # read-only tool
         if tool == "tail_logs":
             obs = tail_logs(self.incident, **args)
         elif tool == "query_metrics":
